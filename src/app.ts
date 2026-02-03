@@ -20,7 +20,7 @@ app.use(cors());
 app.use(express.json());
 app.use(logger);
 
-app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));//
+app.use("/", swaggerUi.serve, swaggerUi.setup(swaggerSpec));//
 
 // console.log("Swagger docs available at /api-docs", swaggerSpec);
 app.use("/api/categories/", categoryRoutes);
