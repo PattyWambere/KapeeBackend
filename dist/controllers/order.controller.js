@@ -2,7 +2,13 @@ import { orderModel } from "../models/order.model";
 import { v4 as uuidv4 } from "uuid";
 import { ProductModel } from "../models/product.model";
 import { CartModel } from "../models/cart.model";
-import mongoose from "mongoose";
+import { userModel } from "../models/user.model";
+import { sendEmail } from "../services/email.service";
+import Stripe from "stripe";
+// Initialize Stripe if secret key is configured
+const stripe = process.env.STRIPE_SECRET_KEY
+    ? new Stripe(process.env.STRIPE_SECRET_KEY)
+    : null;
 /**
  * @swagger
  * tags:
@@ -66,9 +72,18 @@ import mongoose from "mongoose";
  *               items:
  *                 $ref: '#/components/schemas/Order'
  */
-export const getOrders = async (_req, res) => {
-    const orders = await orderModel.find();
-    res.json(orders);
+export const getOrders = async (req, res) => {
+    try {
+        const userId = req.userId;
+        const role = req.role;
+        // Admin sees all, customers see only their own
+        const query = role === "admin" ? {} : { customerId: userId };
+        const orders = await orderModel.find(query).sort({ createdAt: -1 });
+        res.json(orders);
+    }
+    catch (error) {
+        res.status(500).json({ message: "Failed to fetch orders" });
+    }
 };
 /**
  * GET ORDER BY ID
@@ -98,10 +113,21 @@ export const getOrders = async (_req, res) => {
  *         description: Order not found
  */
 export const getOrderById = async (req, res) => {
-    const order = await orderModel.findOne({ id: req.params.id });
-    if (!order)
-        return res.status(404).json({ message: "Order not found" });
-    res.json(order);
+    try {
+        const userId = req.userId;
+        const role = req.role;
+        const order = await orderModel.findOne({ id: req.params.id }).populate("items.productId", "name images price");
+        if (!order)
+            return res.status(404).json({ message: "Order not found" });
+        // Check ownership
+        if (role !== "admin" && order.customerId.toString() !== userId) {
+            return res.status(403).json({ message: "Unauthorized access to this order" });
+        }
+        res.json(order);
+    }
+    catch (error) {
+        res.status(500).json({ message: "Server error" });
+    }
 };
 /**
  * CREATE ORDER (CHECKOUT FROM CART)
@@ -127,31 +153,27 @@ export const getOrderById = async (req, res) => {
  *         description: Product not found
  */
 export const createOrder = async (req, res) => {
-    const session = await mongoose.startSession();
-    session.startTransaction();
     try {
         const userId = req.userId;
-        const cart = await CartModel.findOne({ userId }).session(session);
+        const { paymentMethod, paymentDetails } = req.body;
+        const cart = await CartModel.findOne({ userId });
         if (!cart || cart.items.length === 0) {
-            await session.abortTransaction();
             return res.status(400).json({ message: "Cart is empty" });
         }
         let totalAmount = 0;
         const orderItems = [];
         for (const item of cart.items) {
-            const product = await ProductModel.findById(item.productId).session(session);
+            const product = await ProductModel.findOne({ id: item.productId });
             if (!product) {
-                await session.abortTransaction();
                 return res.status(404).json({ message: "Product not found" });
             }
             if (product.quantity < item.quantity) {
-                await session.abortTransaction();
                 return res.status(400).json({ message: `Not enough stock for ${product.name}` });
             }
             product.quantity -= item.quantity;
             if (product.quantity === 0)
                 product.inStock = false;
-            await product.save({ session });
+            await product.save();
             totalAmount += product.price * item.quantity;
             orderItems.push({
                 productId: product._id,
@@ -159,6 +181,10 @@ export const createOrder = async (req, res) => {
                 price: product.price,
             });
         }
+        // Determine initial payment status based on payment method
+        // For cash on delivery, paymentStatus starts as pending
+        // For card payments, paymentStatus should be marked as paid since it was authorized/confirmed
+        const orderPaymentStatus = paymentMethod === "card" ? "paid" : "pending";
         const order = await orderModel.create([
             {
                 id: uuidv4(),
@@ -166,19 +192,112 @@ export const createOrder = async (req, res) => {
                 items: orderItems,
                 totalAmount,
                 status: "pending",
+                paymentMethod: paymentMethod || "cod",
+                paymentStatus: orderPaymentStatus,
+                paymentDetails: paymentDetails || {},
             },
-        ], { session });
+        ]);
         cart.items = [];
-        await cart.save({ session });
-        await session.commitTransaction();
-        session.endSession();
+        await cart.save();
         return res.status(201).json(order[0]);
     }
     catch (error) {
-        await session.abortTransaction();
-        session.endSession();
         console.error("Create order error:", error);
         return res.status(500).json({ message: "Order creation failed" });
+    }
+};
+/**
+ * CREATE PAYMENT INTENT (STRIPE)
+ */
+/**
+ * @swagger
+ * /api/orders/create-payment-intent:
+ *   post:
+ *     summary: Create a Stripe PaymentIntent for the cart
+ *     tags: [Orders]
+ *     security:
+ *       - BearerAuth: []
+ *     responses:
+ *       200:
+ *         description: PaymentIntent created successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 clientSecret:
+ *                   type: string
+ *                   example: "pi_1234_secret_5678"
+ *                 totalAmount:
+ *                   type: number
+ *                   example: 2000
+ *       400:
+ *         description: Cart is empty or Stripe is not configured
+ *       500:
+ *         description: Server error
+ */
+export const createPaymentIntent = async (req, res) => {
+    try {
+        const userId = req.userId;
+        const { paymentMethodId } = req.body || {};
+        if (!stripe) {
+            return res.status(400).json({
+                message: "Stripe payment gateway is not configured on the server. Please use simulated card payment mode.",
+                fallback: true
+            });
+        }
+        const cart = await CartModel.findOne({ userId });
+        if (!cart || cart.items.length === 0) {
+            return res.status(400).json({ message: "Cart is empty" });
+        }
+        let totalAmount = 0;
+        for (const item of cart.items) {
+            const product = await ProductModel.findOne({ id: item.productId });
+            if (product) {
+                totalAmount += product.price * item.quantity;
+            }
+        }
+        // Stripe expects amount in cents
+        const amountInCents = Math.round(totalAmount * 100);
+        // If using a saved card, attach the customer and confirm immediately
+        if (paymentMethodId) {
+            const user = await userModel.findById(userId);
+            if (!user || !user.stripeCustomerId) {
+                return res.status(400).json({ message: "Customer not found for saved payment method" });
+            }
+            const paymentIntent = await stripe.paymentIntents.create({
+                amount: amountInCents,
+                currency: "usd",
+                customer: user.stripeCustomerId,
+                payment_method: paymentMethodId,
+                confirm: true,
+                metadata: { userId },
+                // For confirming off-session or without redirect:
+                automatic_payment_methods: {
+                    enabled: true,
+                    allow_redirects: "never",
+                },
+            });
+            return res.status(200).json({
+                clientSecret: paymentIntent.client_secret,
+                totalAmount,
+                status: paymentIntent.status,
+            });
+        }
+        // Regular flow for new cards
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount: amountInCents,
+            currency: "usd",
+            metadata: { userId },
+        });
+        return res.status(200).json({
+            clientSecret: paymentIntent.client_secret,
+            totalAmount,
+        });
+    }
+    catch (error) {
+        console.error("Create PaymentIntent error:", error);
+        return res.status(500).json({ message: "Failed to create payment intent", error: error.message });
     }
 };
 /**
@@ -206,42 +325,33 @@ export const createOrder = async (req, res) => {
  *         description: Order not found
  */
 export const cancelOrder = async (req, res) => {
-    const session = await mongoose.startSession();
-    session.startTransaction();
     try {
         const userId = req.userId;
         const role = req.role;
         const { id } = req.params;
-        const order = await orderModel.findOne({ id }).session(session);
+        const order = await orderModel.findOne({ id });
         if (!order) {
-            await session.abortTransaction();
             return res.status(404).json({ message: "Order not found" });
         }
         if (role === "customer" && order.customerId.toString() !== userId) {
-            await session.abortTransaction();
             return res.status(403).json({ message: "Not your order" });
         }
         if (order.status !== "pending") {
-            await session.abortTransaction();
             return res.status(400).json({ message: "Only pending orders can be cancelled" });
         }
         for (const item of order.items) {
-            const product = await ProductModel.findById(item.productId).session(session);
+            const product = await ProductModel.findById(item.productId);
             if (!product)
                 continue;
             product.quantity += item.quantity;
             product.inStock = true;
-            await product.save({ session });
+            await product.save();
         }
         order.status = "cancelled";
-        await order.save({ session });
-        await session.commitTransaction();
-        session.endSession();
+        await order.save();
         return res.json({ message: "Order cancelled successfully", order });
     }
     catch (error) {
-        await session.abortTransaction();
-        session.endSession();
         console.error("Cancel order error:", error);
         return res.status(500).json({ message: "Order cancellation failed" });
     }
@@ -306,8 +416,34 @@ export const updateOrder = async (req, res) => {
         }
         /* ================= ADMIN ================= */
         if (role === "admin") {
+            const oldStatus = order.status;
             order.status = status;
             await order.save();
+            // Notify customer if status actually changed
+            if (oldStatus !== status) {
+                try {
+                    const user = await userModel.findById(order.customerId);
+                    if (user) {
+                        await sendEmail(user.email, `Update on your Order #${order.id.split("-")[0].toUpperCase()}`, `
+              <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 40px; border: 1px solid #f0f0f0; border-radius: 20px;">
+                <h1 style="color: #1a1a1b; font-size: 24px; font-weight: 800; text-transform: uppercase; letter-spacing: -0.02em;">Order Status Updated</h1>
+                <p style="color: #4a4a4a; line-height: 1.6;">Hello ${user.firstName},</p>
+                <p style="color: #4a4a4a; line-height: 1.6;">Your order <strong>#${order.id.split("-")[0].toUpperCase()}</strong> has been updated to <strong>${status.toUpperCase()}</strong>.</p>
+                <div style="margin: 30px 0; background: #f8f8f8; padding: 20px; border-radius: 12px; border-left: 4px solid #3b82f6;">
+                  <span style="font-size: 10px; font-weight: 800; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.1em; display: block; margin-bottom: 4px;">New Status</span>
+                  <span style="font-size: 18px; font-weight: 800; color: #3b82f6; text-transform: uppercase;">${status}</span>
+                </div>
+                <p style="color: #4a4a4a; line-height: 1.6;">You can track your order live on our dashboard:</p>
+                <a href="${process.env.FRONTEND_URL || "http://localhost:5173"}/orders" style="display: inline-block; background: #000; color: #fff; padding: 16px 32px; border-radius: 12px; text-decoration: none; font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em;">View My Orders</a>
+                <p style="margin-top: 40px; font-size: 11px; color: #9ca3af; font-weight: 500;">Thank you for shopping with Kapee!</p>
+              </div>
+              `);
+                    }
+                }
+                catch (emailError) {
+                    console.error("Status update email failed:", emailError);
+                }
+            }
             return res.json(order);
         }
         /* ================= VENDOR ================= */
@@ -324,8 +460,33 @@ export const updateOrder = async (req, res) => {
                     message: "Vendor can only update status to shipped or delivered",
                 });
             }
+            const oldStatus = order.status;
             order.status = status;
             await order.save();
+            // Notify customer
+            if (oldStatus !== status) {
+                try {
+                    const user = await userModel.findById(order.customerId);
+                    if (user) {
+                        await sendEmail(user.email, `Update on your Order #${order.id.split("-")[0].toUpperCase()}`, `
+              <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 40px; border: 1px solid #f0f0f0; border-radius: 20px;">
+                <h1 style="color: #1a1a1b; font-size: 24px; font-weight: 800; text-transform: uppercase; letter-spacing: -0.02em;">Order Status Updated</h1>
+                <p style="color: #4a4a4a; line-height: 1.6;">Hello ${user.firstName},</p>
+                <p style="color: #4a4a4a; line-height: 1.6;">Your order <strong>#${order.id.split("-")[0].toUpperCase()}</strong> has been updated to <strong>${status.toUpperCase()}</strong> by the vendor.</p>
+                <div style="margin: 30px 0; background: #f8f8f8; padding: 20px; border-radius: 12px; border-left: 4px solid #3b82f6;">
+                  <span style="font-size: 10px; font-weight: 800; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.1em; display: block; margin-bottom: 4px;">New Status</span>
+                  <span style="font-size: 18px; font-weight: 800; color: #3b82f6; text-transform: uppercase;">${status}</span>
+                </div>
+                <p style="color: #4a4a4a; line-height: 1.6;">Check your details here:</p>
+                <a href="${process.env.FRONTEND_URL || "http://localhost:5173"}/orders" style="display: inline-block; background: #000; color: #fff; padding: 16px 32px; border-radius: 12px; text-decoration: none; font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em;">View My Orders</a>
+              </div>
+              `);
+                    }
+                }
+                catch (emailError) {
+                    console.error("Vendor update email failed:", emailError);
+                }
+            }
             return res.json(order);
         }
         /* ================= CUSTOMER ================= */
@@ -383,6 +544,9 @@ export const updateOrder = async (req, res) => {
  *         description: Order not found
  */
 export const deleteOrder = async (req, res) => {
+    const role = req.role;
+    if (role !== "admin")
+        return res.status(403).json({ message: "Admins only" });
     const order = await orderModel.findOneAndDelete({ id: req.params.id });
     if (!order)
         return res.status(404).json({ message: "Order not found" });

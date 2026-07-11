@@ -44,8 +44,19 @@ import { categoryModel } from "../models/category.model";
  *                   createdBy:
  *                     type: string
  */
-export const getProducts = async (_req, res) => {
-    const products = await ProductModel.find();
+export const getProducts = async (req, res) => {
+    const { search, category } = req.query;
+    const query = {};
+    if (category && category !== "All Categories") {
+        query.categoryId = category;
+    }
+    if (search) {
+        query.$or = [
+            { name: { $regex: search, $options: "i" } },
+            { description: { $regex: search, $options: "i" } }
+        ];
+    }
+    const products = await ProductModel.find(query);
     res.json(products);
 };
 /**
@@ -146,6 +157,16 @@ export const getProductById = async (req, res) => {
  *                 type: boolean
  *               quantity:
  *                 type: number
+ *               colors:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *               sizes:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *               rating:
+ *                 type: number
  *               images:
  *                 type: array
  *                 items:
@@ -163,16 +184,10 @@ export const getProductById = async (req, res) => {
  *         description: Forbidden (role restriction)
  */
 export const createProduct = async (req, res) => {
-    const { name, price, description, categoryId, inStock, quantity } = req.body;
-    let images = [];
-    // Handle uploaded files from multipart/form-data
-    if (req.files && Array.isArray(req.files)) {
-        images = req.files.map((file) => file.path);
-    }
-    else if (req.body.images) {
-        // Fallback for JSON array or single string (though Swagger now uses multipart)
-        images = Array.isArray(req.body.images) ? req.body.images : [req.body.images];
-    }
+    const { name, price, description, categoryId, inStock, quantity, colors, sizes, rating } = req.body;
+    const uploadedImages = (req.files && Array.isArray(req.files)) ? req.files.map((file) => file.path) : [];
+    const existingImages = req.body.images ? (Array.isArray(req.body.images) ? req.body.images : [req.body.images]) : [];
+    const images = [...existingImages, ...uploadedImages];
     if (!name || typeof name !== "string") {
         return res.status(400).json({ message: "Product name is required" });
     }
@@ -197,6 +212,10 @@ export const createProduct = async (req, res) => {
             message: "Invalid categoryId. Category does not exist"
         });
     }
+    const colorsArr = colors ? (Array.isArray(colors) ? colors : colors.split(",").map((c) => c.trim())) : [];
+    const sizesArr = sizes ? (Array.isArray(sizes) ? sizes : sizes.split(",").map((s) => s.trim())) : [];
+    const ratingNum = rating ? Number(rating) : 0;
+    const numReviewsNum = req.body.numReviews ? Number(req.body.numReviews) : 0;
     const newProduct = await ProductModel.create({
         id: randomUUID(),
         name,
@@ -206,6 +225,10 @@ export const createProduct = async (req, res) => {
         inStock: inStockBool,
         quantity: quantityNum || 0,
         images,
+        colors: colorsArr,
+        sizes: sizesArr,
+        rating: ratingNum,
+        numReviews: numReviewsNum,
         // RBAC: track who created the product (admin or vendor)
         createdBy: req.userId
     });
@@ -250,6 +273,16 @@ export const createProduct = async (req, res) => {
  *                 type: boolean
  *               quantity:
  *                 type: number
+ *               colors:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *               sizes:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *               rating:
+ *                 type: number
  *               images:
  *                 type: array
  *                 items:
@@ -266,15 +299,14 @@ export const createProduct = async (req, res) => {
  */
 export const updateProduct = async (req, res) => {
     const { id } = req.params;
-    const { name, price, description, categoryId, inStock, quantity } = req.body;
+    const { name, price, description, categoryId, inStock, quantity, colors, sizes, rating } = req.body;
     const userId = req.userId;
     const role = req.role;
     let images = undefined;
-    if (req.files && Array.isArray(req.files) && req.files.length > 0) {
-        images = req.files.map((file) => file.path);
-    }
-    else if (req.body.images) {
-        images = Array.isArray(req.body.images) ? req.body.images : [req.body.images];
+    const uploadedImages = (req.files && Array.isArray(req.files)) ? req.files.map((file) => file.path) : [];
+    const existingImages = req.body.images ? (Array.isArray(req.body.images) ? req.body.images : [req.body.images]) : [];
+    if (uploadedImages.length > 0 || req.body.images !== undefined) {
+        images = [...existingImages, ...uploadedImages];
     }
     if (name !== undefined && typeof name !== "string") {
         return res.status(400).json({ message: "Invalid product name" });
@@ -294,6 +326,9 @@ export const updateProduct = async (req, res) => {
     if (quantityNum !== undefined && (isNaN(quantityNum) || quantityNum < 0)) {
         return res.status(400).json({ message: "Invalid quantity" });
     }
+    const colorsArr = colors ? (Array.isArray(colors) ? colors : colors.split(",").map((c) => c.trim())) : undefined;
+    const sizesArr = sizes ? (Array.isArray(sizes) ? sizes : sizes.split(",").map((s) => s.trim())) : undefined;
+    const ratingNum = rating !== undefined ? Number(rating) : undefined;
     // Find product to enforce ownership for vendors
     const product = await ProductModel.findOne({ id });
     if (!product) {
@@ -317,6 +352,12 @@ export const updateProduct = async (req, res) => {
         product.quantity = quantityNum;
     if (images !== undefined)
         product.images = images;
+    if (colorsArr !== undefined)
+        product.colors = colorsArr;
+    if (sizesArr !== undefined)
+        product.sizes = sizesArr;
+    if (ratingNum !== undefined)
+        product.rating = ratingNum;
     await product.save();
     res.json(product);
 };
@@ -603,4 +644,56 @@ export const uploadProductImage = async (req, res) => {
         console.error("Upload product images error:", error);
         res.status(500).json({ message: "Upload failed" });
     }
+};
+/**
+ * @swagger
+ * /api/products/rateProduct/{id}:
+ *   post:
+ *     summary: Submit a rating for a product
+ *     tags: [Products]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               rating:
+ *                 type: number
+ *                 minimum: 1
+ *                 maximum: 5
+ *     responses:
+ *       200:
+ *         description: Rating submitted successfully
+ *       404:
+ *         description: Product not found
+ */
+export const rateProduct = async (req, res) => {
+    const { id } = req.params;
+    const { rating } = req.body;
+    const ratingNum = Number(rating);
+    if (isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+        return res.status(400).json({ message: "Invalid rating. Must be between 1 and 5." });
+    }
+    const product = await ProductModel.findOne({ id });
+    if (!product) {
+        return res.status(404).json({ message: "Product not found" });
+    }
+    const currentNumReviews = product.numReviews || 0;
+    const currentRating = product.rating || 0;
+    const totalRatingPoints = currentRating * currentNumReviews;
+    product.numReviews = currentNumReviews + 1;
+    product.rating = (totalRatingPoints + ratingNum) / product.numReviews;
+    await product.save();
+    res.status(200).json({
+        message: "Rating submitted successfully",
+        newRating: product.rating,
+        numReviews: product.numReviews
+    });
 };

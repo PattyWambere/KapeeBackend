@@ -1,6 +1,5 @@
 import { Router } from "express";
-import { getProducts, getProductById, createProduct, updateProduct, deleteProduct, getProductStats, getTopProducts, getLowStockProducts, getPriceDistribution, uploadProductImage // Import new controller
- } from "../controllers/product.controller";
+import { getProducts, getProductById, createProduct, updateProduct, deleteProduct, getProductStats, getTopProducts, getLowStockProducts, getPriceDistribution, uploadProductImage, rateProduct } from "../controllers/product.controller";
 import { protect } from "../middleware/auth.middleware";
 import { authorize } from "../middleware/role.middleware";
 import { upload } from "../services/cloudinary.service";
@@ -8,6 +7,7 @@ const router = Router();
 // Public product endpoints
 router.get("/products", getProducts);
 router.get("/productsById/:id", getProductById);
+router.post("/rateProduct/:id", rateProduct);
 // Aggregation / stats endpoints (public)
 router.get("/products/stats", getProductStats);
 router.get("/products/top", getTopProducts);

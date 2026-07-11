@@ -23,6 +23,8 @@ const userSchema = new Schema({
         enum: ["admin", "vendor", "customer"],
         default: "customer",
     },
+    // ===== Stripe customer ID for saved payment methods =====
+    stripeCustomerId: { type: String },
 }, {
     timestamps: true, // useful for user management
 });

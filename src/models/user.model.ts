@@ -9,6 +9,7 @@ export interface User extends Document {
   resetTokenExpiry?: Date;
   role: "admin" | "vendor" | "customer";
   avatar?: string;
+  stripeCustomerId?: string;
 }
 
 const userSchema = new Schema<User>(
@@ -40,6 +41,9 @@ const userSchema = new Schema<User>(
       enum: ["admin", "vendor", "customer"],
       default: "customer",
     },
+
+    // ===== Stripe customer ID for saved payment methods =====
+    stripeCustomerId: { type: String },
   },
   {
     timestamps: true, // useful for user management

@@ -10,6 +10,13 @@ export interface Order extends Document {
   }[];
   totalAmount: number;
   status: "pending" | "shipped" | "delivered" | "cancelled";
+  paymentMethod: "card" | "cod";
+  paymentStatus: "pending" | "paid" | "failed";
+  paymentDetails?: {
+    cardType?: string;
+    last4?: string;
+    transactionId?: string;
+  };
   createdAt: Date;
   updatedAt: Date;
 }
@@ -42,6 +49,24 @@ const orderSchema = new Schema<Order>(
       type: String,
       enum: ["pending", "shipped", "delivered", "cancelled"],
       default: "pending",
+    },
+
+    paymentMethod: {
+      type: String,
+      enum: ["card", "cod"],
+      default: "cod",
+    },
+
+    paymentStatus: {
+      type: String,
+      enum: ["pending", "paid", "failed"],
+      default: "pending",
+    },
+
+    paymentDetails: {
+      cardType: { type: String },
+      last4: { type: String },
+      transactionId: { type: String },
     },
   },
   { timestamps: true }

@@ -48,8 +48,22 @@ import { ReviewModel } from "../models/review.model";
  *                   createdBy:
  *                     type: string
  */
-export const getProducts = async (_req: Request, res: Response) => {
-  const products = await ProductModel.find();
+export const getProducts = async (req: Request, res: Response) => {
+  const { search, category } = req.query;
+  const query: any = {};
+
+  if (category && category !== "All Categories") {
+    query.categoryId = category;
+  }
+
+  if (search) {
+    query.$or = [
+      { name: { $regex: search, $options: "i" } },
+      { description: { $regex: search, $options: "i" } }
+    ];
+  }
+
+  const products = await ProductModel.find(query);
   res.json(products);
 };
 
@@ -189,15 +203,10 @@ export const getProductById = async (req: Request, res: Response) => {
 
 export const createProduct = async (req: Request, res: Response) => {
   const { name, price, description, categoryId, inStock, quantity, colors, sizes, rating } = req.body;
-  let images: string[] = [];
-
-  // Handle uploaded files from multipart/form-data
-  if (req.files && Array.isArray(req.files)) {
-    images = (req.files as any[]).map((file) => file.path);
-  } else if (req.body.images) {
-    // Fallback for JSON array or single string (though Swagger now uses multipart)
-    images = Array.isArray(req.body.images) ? req.body.images : [req.body.images];
-  }
+  
+  const uploadedImages = (req.files && Array.isArray(req.files)) ? (req.files as any[]).map((file) => file.path) : [];
+  const existingImages = req.body.images ? (Array.isArray(req.body.images) ? req.body.images : [req.body.images]) : [];
+  const images = [...existingImages, ...uploadedImages];
 
   if (!name || typeof name !== "string") {
     return res.status(400).json({ message: "Product name is required" });
@@ -326,10 +335,11 @@ export const updateProduct = async (req: Request, res: Response) => {
   const role = (req as any).role as "admin" | "vendor" | "customer" | undefined;
 
   let images: string[] | undefined = undefined;
-  if (req.files && Array.isArray(req.files) && req.files.length > 0) {
-    images = (req.files as any[]).map((file) => file.path);
-  } else if (req.body.images) {
-    images = Array.isArray(req.body.images) ? req.body.images : [req.body.images];
+  const uploadedImages = (req.files && Array.isArray(req.files)) ? (req.files as any[]).map((file) => file.path) : [];
+  const existingImages = req.body.images ? (Array.isArray(req.body.images) ? req.body.images : [req.body.images]) : [];
+  
+  if (uploadedImages.length > 0 || req.body.images !== undefined) {
+    images = [...existingImages, ...uploadedImages];
   }
 
   if (name !== undefined && typeof name !== "string") {

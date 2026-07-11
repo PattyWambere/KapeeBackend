@@ -3,7 +3,15 @@ import { orderModel } from "../models/order.model";
 import { v4 as uuidv4 } from "uuid";
 import { ProductModel } from "../models/product.model";
 import { CartModel } from "../models/cart.model";
+import { userModel } from "../models/user.model";
+import { sendEmail } from "../services/email.service";
 import mongoose from "mongoose";
+import Stripe from "stripe";
+
+// Initialize Stripe if secret key is configured
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
 /**
  * @swagger
  * tags:
@@ -155,6 +163,7 @@ export const getOrderById = async (req: Request, res: Response) => {
 export const createOrder = async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId;
+    const { paymentMethod, paymentDetails } = req.body;
 
     const cart = await CartModel.findOne({ userId });
     if (!cart || cart.items.length === 0) {
@@ -188,6 +197,11 @@ export const createOrder = async (req: Request, res: Response) => {
       });
     }
 
+    // Determine initial payment status based on payment method
+    // For cash on delivery, paymentStatus starts as pending
+    // For card payments, paymentStatus should be marked as paid since it was authorized/confirmed
+    const orderPaymentStatus = paymentMethod === "card" ? "paid" : "pending";
+
     const order = await orderModel.create(
       [
         {
@@ -196,6 +210,9 @@ export const createOrder = async (req: Request, res: Response) => {
           items: orderItems,
           totalAmount,
           status: "pending",
+          paymentMethod: paymentMethod || "cod",
+          paymentStatus: orderPaymentStatus,
+          paymentDetails: paymentDetails || {},
         },
       ]
     );
@@ -207,6 +224,109 @@ export const createOrder = async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Create order error:", error);
     return res.status(500).json({ message: "Order creation failed" });
+  }
+};
+
+/**
+ * CREATE PAYMENT INTENT (STRIPE)
+ */
+/**
+ * @swagger
+ * /api/orders/create-payment-intent:
+ *   post:
+ *     summary: Create a Stripe PaymentIntent for the cart
+ *     tags: [Orders]
+ *     security:
+ *       - BearerAuth: []
+ *     responses:
+ *       200:
+ *         description: PaymentIntent created successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 clientSecret:
+ *                   type: string
+ *                   example: "pi_1234_secret_5678"
+ *                 totalAmount:
+ *                   type: number
+ *                   example: 2000
+ *       400:
+ *         description: Cart is empty or Stripe is not configured
+ *       500:
+ *         description: Server error
+ */
+export const createPaymentIntent = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId;
+    const { paymentMethodId } = req.body || {};
+
+    if (!stripe) {
+      return res.status(400).json({
+        message: "Stripe payment gateway is not configured on the server. Please use simulated card payment mode.",
+        fallback: true
+      });
+    }
+
+    const cart = await CartModel.findOne({ userId });
+    if (!cart || cart.items.length === 0) {
+      return res.status(400).json({ message: "Cart is empty" });
+    }
+
+    let totalAmount = 0;
+    for (const item of cart.items) {
+      const product = await ProductModel.findOne({ id: item.productId } as any);
+      if (product) {
+        totalAmount += product.price * item.quantity;
+      }
+    }
+
+    // Stripe expects amount in cents
+    const amountInCents = Math.round(totalAmount * 100);
+
+    // If using a saved card, attach the customer and confirm immediately
+    if (paymentMethodId) {
+      const user = await userModel.findById(userId);
+      if (!user || !user.stripeCustomerId) {
+        return res.status(400).json({ message: "Customer not found for saved payment method" });
+      }
+
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amountInCents,
+        currency: "usd",
+        customer: user.stripeCustomerId,
+        payment_method: paymentMethodId,
+        confirm: true,
+        metadata: { userId },
+        // For confirming off-session or without redirect:
+        automatic_payment_methods: {
+          enabled: true,
+          allow_redirects: "never",
+        },
+      });
+
+      return res.status(200).json({
+        clientSecret: paymentIntent.client_secret,
+        totalAmount,
+        status: paymentIntent.status,
+      });
+    }
+
+    // Regular flow for new cards
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountInCents,
+      currency: "usd",
+      metadata: { userId },
+    });
+
+    return res.status(200).json({
+      clientSecret: paymentIntent.client_secret,
+      totalAmount,
+    });
+  } catch (error: any) {
+    console.error("Create PaymentIntent error:", error);
+    return res.status(500).json({ message: "Failed to create payment intent", error: error.message });
   }
 };
 
@@ -343,8 +463,39 @@ export const updateOrder = async (req: Request, res: Response) => {
 
     /* ================= ADMIN ================= */
     if (role === "admin") {
+      const oldStatus = order.status;
       order.status = status;
       await order.save();
+
+      // Notify customer if status actually changed
+      if (oldStatus !== status) {
+        try {
+          const user = await userModel.findById(order.customerId);
+          if (user) {
+            await sendEmail(
+              user.email,
+              `Update on your Order #${order.id.split("-")[0].toUpperCase()}`,
+              `
+              <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 40px; border: 1px solid #f0f0f0; border-radius: 20px;">
+                <h1 style="color: #1a1a1b; font-size: 24px; font-weight: 800; text-transform: uppercase; letter-spacing: -0.02em;">Order Status Updated</h1>
+                <p style="color: #4a4a4a; line-height: 1.6;">Hello ${user.firstName},</p>
+                <p style="color: #4a4a4a; line-height: 1.6;">Your order <strong>#${order.id.split("-")[0].toUpperCase()}</strong> has been updated to <strong>${status.toUpperCase()}</strong>.</p>
+                <div style="margin: 30px 0; background: #f8f8f8; padding: 20px; border-radius: 12px; border-left: 4px solid #3b82f6;">
+                  <span style="font-size: 10px; font-weight: 800; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.1em; display: block; margin-bottom: 4px;">New Status</span>
+                  <span style="font-size: 18px; font-weight: 800; color: #3b82f6; text-transform: uppercase;">${status}</span>
+                </div>
+                <p style="color: #4a4a4a; line-height: 1.6;">You can track your order live on our dashboard:</p>
+                <a href="${process.env.FRONTEND_URL || "http://localhost:5173"}/orders" style="display: inline-block; background: #000; color: #fff; padding: 16px 32px; border-radius: 12px; text-decoration: none; font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em;">View My Orders</a>
+                <p style="margin-top: 40px; font-size: 11px; color: #9ca3af; font-weight: 500;">Thank you for shopping with GuraFaster!</p>
+              </div>
+              `
+            );
+          }
+        } catch (emailError) {
+          console.error("Status update email failed:", emailError);
+        }
+      }
+
       return res.json(order);
     }
 
@@ -367,8 +518,38 @@ export const updateOrder = async (req: Request, res: Response) => {
         });
       }
 
+      const oldStatus = order.status;
       order.status = status;
       await order.save();
+
+      // Notify customer
+      if (oldStatus !== status) {
+        try {
+          const user = await userModel.findById(order.customerId);
+          if (user) {
+            await sendEmail(
+              user.email,
+              `Update on your Order #${order.id.split("-")[0].toUpperCase()}`,
+              `
+              <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 40px; border: 1px solid #f0f0f0; border-radius: 20px;">
+                <h1 style="color: #1a1a1b; font-size: 24px; font-weight: 800; text-transform: uppercase; letter-spacing: -0.02em;">Order Status Updated</h1>
+                <p style="color: #4a4a4a; line-height: 1.6;">Hello ${user.firstName},</p>
+                <p style="color: #4a4a4a; line-height: 1.6;">Your order <strong>#${order.id.split("-")[0].toUpperCase()}</strong> has been updated to <strong>${status.toUpperCase()}</strong> by the vendor.</p>
+                <div style="margin: 30px 0; background: #f8f8f8; padding: 20px; border-radius: 12px; border-left: 4px solid #3b82f6;">
+                  <span style="font-size: 10px; font-weight: 800; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.1em; display: block; margin-bottom: 4px;">New Status</span>
+                  <span style="font-size: 18px; font-weight: 800; color: #3b82f6; text-transform: uppercase;">${status}</span>
+                </div>
+                <p style="color: #4a4a4a; line-height: 1.6;">Check your details here:</p>
+                <a href="${process.env.FRONTEND_URL || "http://localhost:5173"}/orders" style="display: inline-block; background: #000; color: #fff; padding: 16px 32px; border-radius: 12px; text-decoration: none; font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em;">View My Orders</a>
+              </div>
+              `
+            );
+          }
+        } catch (emailError) {
+          console.error("Vendor update email failed:", emailError);
+        }
+      }
+
       return res.json(order);
     }
 

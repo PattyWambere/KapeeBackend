@@ -23,6 +23,17 @@ import { ProductModel } from "../models/product.model";
  *         quantity:
  *           type: number
  *           example: 2
+ *         name:
+ *           type: string
+ *           example: "Basic White Tee"
+ *         price:
+ *           type: number
+ *           example: 25.0
+ *         images:
+ *           type: array
+ *           items:
+ *             type: string
+ *           example: ["https://res.cloudinary.com/demo/image1.jpg"]
  *
  *     Cart:
  *       type: object
@@ -62,7 +73,20 @@ export const getCart = async (req, res) => {
         return res.status(400).json({ message: "userId is required" });
     }
     const cart = await CartModel.findOne({ userId });
-    res.json(cart ?? { userId, items: [] });
+    if (!cart) {
+        return res.json({ userId, items: [] });
+    }
+    // Populate product details manually
+    const populatedItems = await Promise.all(cart.items.map(async (item) => {
+        const product = await ProductModel.findOne({ id: item.productId });
+        return {
+            ...item.toObject(),
+            name: product?.name || "Unknown Product",
+            price: product?.price || 0,
+            images: product?.images || []
+        };
+    }));
+    res.json({ userId, items: populatedItems });
 };
 /**
  * ADD ITEM TO CART

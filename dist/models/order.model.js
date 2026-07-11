@@ -23,5 +23,20 @@ const orderSchema = new Schema({
         enum: ["pending", "shipped", "delivered", "cancelled"],
         default: "pending",
     },
+    paymentMethod: {
+        type: String,
+        enum: ["card", "cod"],
+        default: "cod",
+    },
+    paymentStatus: {
+        type: String,
+        enum: ["pending", "paid", "failed"],
+        default: "pending",
+    },
+    paymentDetails: {
+        cardType: { type: String },
+        last4: { type: String },
+        transactionId: { type: String },
+    },
 }, { timestamps: true });
 export const orderModel = mongoose.model("Order", orderSchema);
